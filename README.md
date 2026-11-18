@@ -109,6 +109,11 @@ wasm-tools workload installs (`Microsoft.NET.Workload.Emscripten.Current.Manifes
 
 To add a band, add it to the `wasm` matrix.
 
+The archives are single-threaded, so they link into hosts without WebAssembly threads, such as .NET. Under
+Emscripten, meson's `threads` dependency adds `-pthread`, which compiles atomics and shared memory. `build.py` removes
+that dependency from HarfBuzz's `meson.build` for the build (and restores the file afterwards) and defines `HB_NO_MT`.
+The build fails if an object of `libnharfbuzz.a` uses atomics.
+
 ### Known issues in HarfBuzz
 
 - HarfBuzz 15.1.0 does not define `HB_HAS_GPU` in `hb-features.h`, although harfbuzz-gpu is built and exported.

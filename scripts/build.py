@@ -22,6 +22,7 @@ exports.txt, licenses/ and build-info.json.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import pathlib
@@ -189,7 +190,7 @@ class Target:
         self.ar, self.nm = llvm / "llvm-ar", llvm / "llvm-nm"
         self.node = self.env["DOTNET_EMSCRIPTEN_NODE_JS"]
         self.system = "emscripten"
-        self.flags = ["-msimd128", "-ffunction-sections", "-fdata-sections"]
+        self.flags = ["-msimd128", "-ffunction-sections", "-fdata-sections", "-DHB_NO_MT"]
         self.platform = f"wasm-emscripten-{toolchain['emscripten']}"
         self.rid = f"browser-wasm-emscripten-{toolchain['emscripten']}"
         self.toolchain = toolchain
@@ -287,6 +288,32 @@ class Target:
         if self.os == "macos" and self.arch == "x64":
             return subprocess.run(["arch", "-x86_64", "/usr/bin/true"], capture_output=True).returncode == 0
         return self.os == "windows" and self.arch == "x64"
+
+
+# Under Emscripten, meson's threads dependency is -pthread, which compiles atomics and shared memory that
+# single-threaded WebAssembly hosts (.NET) cannot link. WebAssembly builds skip it and define HB_NO_MT.
+NO_THREADS = ("if host_machine.system() != 'windows'\n  thread_dep = dependency('threads', required: false)",
+              "if host_machine.system() not in ['windows', 'emscripten']\n  thread_dep = dependency('threads', required: false)")
+
+
+@contextlib.contextmanager
+def without_threads():
+    """Applies NO_THREADS to the checkout's meson.build for the duration of a build."""
+    file = HARFBUZZ / "meson.build"
+    original = file.read_text()
+    if NO_THREADS[0] not in original:
+        sys.exit(f"{file} no longer contains the threads dependency that WebAssembly builds remove")
+    file.write_text(original.replace(NO_THREADS[0], NO_THREADS[1]))
+    try:
+        yield
+    finally:
+        file.write_text(original)
+
+
+def check_single_threaded(library):
+    """Fails when an object of the WebAssembly library uses atomics (its target_features section lists +atomics)."""
+    if b"+\x07atomics" in library.read_bytes():
+        sys.exit(f"{library} uses WebAssembly atomics; single-threaded hosts cannot link it")
 
 
 def msvc_environment(arch):
@@ -550,11 +577,12 @@ def main():
         cross = build_dir / "cross.ini"
         target.cross_file(cross)
         options = [f"-D{k}={v}" for k, v in target.options.items()]
-        run([meson, "setup", meson_dir, HARFBUZZ, "--cross-file", cross, f"--prefix={install_dir}", "--libdir=lib",
-             "--includedir=include", *options], env=target.env)
-        run([ninja, "-C", meson_dir], env=target.env)
-        run([ninja, "-C", meson_dir, *(f"src/{c}.def" for c in COMPONENTS)], env=target.env)
-        run([meson, "install", "-C", meson_dir, "--no-rebuild", "--quiet"], env=target.env)
+        with without_threads() if target.kind == "wasm" else contextlib.nullcontext():
+            run([meson, "setup", meson_dir, HARFBUZZ, "--cross-file", cross, f"--prefix={install_dir}",
+                 "--libdir=lib", "--includedir=include", *options], env=target.env)
+            run([ninja, "-C", meson_dir], env=target.env)
+            run([ninja, "-C", meson_dir, *(f"src/{c}.def" for c in COMPONENTS)], env=target.env)
+            run([meson, "install", "-C", meson_dir, "--no-rebuild", "--quiet"], env=target.env)
 
     exports = sorted({line for c in COMPONENTS for line in (meson_dir / "src" / f"{c}.def").read_text().split()
                       if re.fullmatch(r"hb_\w+", line)})
@@ -582,6 +610,8 @@ def main():
     merge_static(target, components, static_lib, work / "merge")
     (stage / "static").mkdir()
     strip_static(target, static_lib, stage / "static" / static_name)
+    if target.kind == "wasm":
+        check_single_threaded(stage / "static" / static_name)
 
     info = {"static": f"static/{static_name}"}
     if target.kind != "wasm":
