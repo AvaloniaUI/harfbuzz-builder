@@ -1,0 +1,296 @@
+name: Build HarfBuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      harfbuzz:
+        description: "HarfBuzz version: a tag (15.1.0), a branch or a full commit SHA"
+        required: true
+        default: "15.1.0"
+      repository:
+        description: "GitHub repository of HarfBuzz"
+        required: true
+        default: "harfbuzz/harfbuzz"
+
+permissions:
+  contents: read
+
+env:
+  HARFBUZZ_BUILDER_REPOSITORY: ${{ inputs.repository }}
+  ANDROID_NDK_VERSION: r27d
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.version.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve ${{ inputs.harfbuzz }}
+        id: version
+        env:
+          REF: ${{ inputs.harfbuzz }}
+        run: python3 scripts/fetch-harfbuzz.py --repository "$HARFBUZZ_BUILDER_REPOSITORY" --ref "$REF" --resolve-only --github-output
+
+      - name: Check that the release does not exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::Release $TAG already exists"
+            exit 1
+          fi
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch HarfBuzz
+        run: python3 scripts/fetch-harfbuzz.py --repository "$HARFBUZZ_BUILDER_REPOSITORY" --ref "${{ needs.resolve.outputs.sha }}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: .
+          file: docker/linux/Dockerfile
+          load: true
+          tags: harfbuzz-builder-linux:${{ matrix.arch }}
+          cache-from: type=gha,scope=linux-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=linux-${{ matrix.arch }}
+
+      - name: Build
+        env:
+          HARFBUZZ_BUILDER_IMAGE: harfbuzz-builder-linux:${{ matrix.arch }}
+        run: scripts/build-linux.sh ${{ matrix.arch }} --tag "${{ needs.resolve.outputs.tag }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harfbuzz-linux-${{ matrix.arch }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    needs: resolve
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install meson and ninja
+        run: python -m pip install -r requirements.txt
+
+      - name: Fetch HarfBuzz
+        run: python scripts/fetch-harfbuzz.py --repository "$env:HARFBUZZ_BUILDER_REPOSITORY" --ref "${{ needs.resolve.outputs.sha }}"
+
+      - name: Build
+        run: python scripts/build.py windows ${{ matrix.arch }} --tag "${{ needs.resolve.outputs.tag }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harfbuzz-windows-${{ matrix.arch }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    needs: resolve
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install meson and ninja
+        run: python -m pip install -r requirements.txt
+
+      - name: Fetch HarfBuzz
+        run: python scripts/fetch-harfbuzz.py --repository "$HARFBUZZ_BUILDER_REPOSITORY" --ref "${{ needs.resolve.outputs.sha }}"
+
+      - name: Build
+        run: python scripts/build.py macos ${{ matrix.arch }} --tag "${{ needs.resolve.outputs.tag }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harfbuzz-macos-${{ matrix.arch }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  android:
+    name: Android ${{ matrix.arch }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install meson and ninja
+        run: python -m pip install -r requirements.txt
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
+          add-to-path: false
+
+      - name: Fetch HarfBuzz
+        run: python scripts/fetch-harfbuzz.py --repository "$HARFBUZZ_BUILDER_REPOSITORY" --ref "${{ needs.resolve.outputs.sha }}"
+
+      - name: Build
+        run: python scripts/build.py android ${{ matrix.arch }} --tag "${{ needs.resolve.outputs.tag }}" --ndk "${{ steps.ndk.outputs.ndk-path }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harfbuzz-android-${{ matrix.arch }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  wasm:
+    name: WebAssembly (.NET SDK ${{ matrix.sdk-band }})
+    needs: resolve
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # One build per Emscripten version: each .NET SDK band links with the Emscripten of its wasm-tools workload.
+        sdk-band: ["10.0.100", "11.0.100"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install meson and ninja
+        run: python -m pip install -r requirements.txt
+
+      - name: Fetch HarfBuzz
+        run: python scripts/fetch-harfbuzz.py --repository "$HARFBUZZ_BUILDER_REPOSITORY" --ref "${{ needs.resolve.outputs.sha }}"
+
+      - name: Fetch the Emscripten of the .NET ${{ matrix.sdk-band }} wasm-tools workload
+        run: python scripts/fetch-emscripten.py --sdk-band ${{ matrix.sdk-band }}
+
+      - name: Build
+        run: python scripts/build.py wasm wasm32 --tag "${{ needs.resolve.outputs.tag }}" --emscripten "toolchains/emscripten-${{ matrix.sdk-band }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harfbuzz-wasm-${{ matrix.sdk-band }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  apple:
+    name: ${{ matrix.platform }}
+    needs: resolve
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ios, tvos, maccatalyst]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install meson and ninja
+        run: python -m pip install -r requirements.txt
+
+      - name: Fetch HarfBuzz
+        run: python scripts/fetch-harfbuzz.py --repository "$HARFBUZZ_BUILDER_REPOSITORY" --ref "${{ needs.resolve.outputs.sha }}"
+
+      - name: Build the slices
+        run: |
+          python scripts/package-apple.py ${{ matrix.platform }} --list-slices | while read -r slice arch; do
+            python scripts/build.py "$slice" "$arch" --no-archive --tag "${{ needs.resolve.outputs.tag }}"
+          done
+
+      - name: XCFrameworks
+        run: python scripts/package-apple.py ${{ matrix.platform }} --tag "${{ needs.resolve.outputs.tag }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harfbuzz-${{ matrix.platform }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Release
+    needs: [resolve, linux, windows, macos, android, wasm, apple]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "harfbuzz-*"
+          path: release
+          merge-multiple: true
+
+      - name: Checksums and manifest
+        env:
+          REF: ${{ inputs.harfbuzz }}
+        run: >
+          python3 scripts/make-release.py release
+          --tag "${{ needs.resolve.outputs.tag }}"
+          --repository "$HARFBUZZ_BUILDER_REPOSITORY"
+          --sha "${{ needs.resolve.outputs.sha }}"
+          --version "${{ needs.resolve.outputs.version }}"
+          --ref "$REF"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: >
+          gh release create "$TAG" release/*.tar.gz release/SHA256SUMS release/manifest.json
+          --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "HarfBuzz $TAG" --notes-file release/release-notes.md
